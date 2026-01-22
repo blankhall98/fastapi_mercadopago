@@ -16,4 +16,25 @@ PLANS = [
 ]
 
 def upsert_plan(db: Session, data: dict) -> Plan:
-    pass
+    plan = db.query(Plan).filter(Plan.code == data["code"]).first()
+    if plan:
+        for k, v in data.items():
+            setattr(plan, k, v)
+        return plan
+    
+    plan = Plan(**data)
+    db.add(plan)
+    return plan
+
+def main():
+    db = SessionLocal()
+    try:
+        for data in PLANS:
+            upsert_plan(db, data)
+        db.commit()
+        print("Seeded plans:", [p["code"] for p in PLANS])
+    finally:
+        db.close()
+
+if __name__ == "__main__":
+    main()
