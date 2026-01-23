@@ -48,14 +48,30 @@ def create_one_time_payment_link(
 
     # Preference payload (checkout PRO)
     preference_data = {
-        "items": [],
+        "items": [
+            {
+                "title": plan.name,
+                "quantity": 1,
+                "unit_price": float(plan.price),
+                "currency_id": plan.currency or settings.mp_currency,
+            }
+        ],
         #important: your own stable reference
-        "external_reference": "",
+        "external_reference": f"user:{user.id}|ent:{ent.id}|order:{order_id}|plan:{plan.code}",
         #Metadata for later identification
-        "metadata": {},
+        "metadata": {
+            "user_id": user.id,
+            "entitlement_id": ent.id,
+            "order_id": order_id,
+            "plan_code": plan.code,
+        },
         #MP notifications
         "notification_url": settings.mp_webhook_url,
-        "back_urls": {},
+        "back_urls": {
+            "success": f"{settings.app_base_url}/billing/success",
+            "failure": f"{settings.app_base_url}/billing/failure",
+            "pending": f"{settings.app_base_url}/billing/pending",
+        },
         "auto_return": "approved",
     }
 
@@ -63,9 +79,21 @@ def create_one_time_payment_link(
 
     #create preference item
     result = sdk.preference().create(preference_data)
-    resp = result("response") or {}
-    status = result("status")
+    resp = result.get("response") or {}
+    status = result.get("status")
 
     if status not in (200, 201):
         raise HTTPException(502, {"mp_status": status, "mp_response": resp})
+    
+    preference_id = resp.get("id")
+    init_point = resp.get("init_point") or resp.get("sandbox_init_point")
+    if not preference_id or not init_point:
+        raise HTTPException(502, {"mp_response": resp})
+    
+    #Store MP reference (still inactive until webhook confirms payment)
+    ent.mp_preference_id = preference_id
+    db.commit()
+
+    return CreateOneTimeLinkOut(preference_id=preference_id, init_point=init_point)
+
     
