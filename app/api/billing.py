@@ -1,4 +1,6 @@
 from uuid import uuid4
+from datetime import datetime, timezone
+from app.utils.dt import as_utc_aware
 
 from fastapi import APIRouter, HTTPException, Depends
 from sqlalchemy.orm import Session
@@ -86,7 +88,7 @@ def create_one_time_payment_link(
         raise HTTPException(502, {"mp_status": status, "mp_response": resp})
     
     preference_id = resp.get("id")
-    init_point = resp.get("init_point") or resp.get("sandbox_init_point")
+    init_point = resp.get("sandbox_init_point") or resp.get("init_point")
     if not preference_id or not init_point:
         raise HTTPException(502, {"mp_response": resp})
     
@@ -96,4 +98,29 @@ def create_one_time_payment_link(
 
     return CreateOneTimeLinkOut(preference_id=preference_id, init_point=init_point)
 
+@router.get("/me")
+def my_billing(db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    ents = (db.query(Entitlement, Plan)
+            .join(Plan, Plan.id == Entitlement.plan_id)
+            .filter(Entitlement.user_id == user.id)
+            .all()
+            )
     
+    now = datetime.now(timezone.utc)
+
+    out = []
+    for ent, plan in ents:
+        exp = as_utc_aware(ent.expires_at)
+        is_active = ent.status == "active" and (exp is None or exp > now)
+        out.append({
+            "plan_code": plan.code,
+            "plan_kind": plan.kind,
+            "status": ent.status,
+            "expires_at": exp.isoformat() if exp else None,
+            "mp_payment_id": ent.mp_payment_id,
+            "mp_preference_id": ent.mp_preference_id,
+            "mp_preapproval_id": ent.mp_preapproval_id,
+            "is_active_now": is_active,
+        })
+
+    return {"user_id": user.id, "entitlements": out}

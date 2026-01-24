@@ -22,6 +22,7 @@ class Settings(BaseSettings):
     mp_webhook_url: str = ""
     app_base_url: str = "http://localhost:8000"
     mp_currency: str = "MXN"
+    mp_webhook_secret: str = ""
 
     # Tell pydantic to read from .env file
     model_config = SettingsConfigDict(
