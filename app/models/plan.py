@@ -24,3 +24,10 @@ class Plan(Base):
     # For one_time plans: duration days of access
     # For recurring: we dont rely on this, but it can be informational
     access_duration_days : Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    # For recurring plans
+    # Examples:
+    # - monthly: interval_count=1, interval_unit="months"
+    # - annual: interval_count=12, interval_unit="months"
+    interval_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    interval_unit: Mapped[str | None] = mapped_column(String(16), nullable=True)  # e.g., "days", "months", "years"

@@ -11,7 +11,8 @@ from app.api.deps import get_current_user
 from app.models.plan import Plan
 from app.models.entitlement import Entitlement
 from app.integrations.mercadopago_client import mp_sdk
-from app.schemas.billing import PlanOut, CreateOneTimeLinkIn, CreateOneTimeLinkOut
+from app.integrations.mp_subscriptions import mp_create_preapproval, mp_update_preapproval
+from app.schemas.billing import PlanOut, CreateOneTimeLinkIn, CreateOneTimeLinkOut, CreateRecurringLinkIn, CreateRecurringLinkOut, CancelRecurringIn, CancelRecurringOut
 from app.models.user import User
 
 router = APIRouter(prefix="/billing", tags=["billing"])
@@ -88,7 +89,11 @@ def create_one_time_payment_link(
         raise HTTPException(502, {"mp_status": status, "mp_response": resp})
     
     preference_id = resp.get("id")
-    init_point = resp.get("sandbox_init_point") or resp.get("init_point")
+
+    token = settings.mp_access_token or ""
+    is_test = token.startswith("TEST-")
+
+    init_point = (resp.get("sandbox_init_point") if is_test else resp.get("init_point")) or resp.get("init_point") or resp.get("sandbox_init_point")
     if not preference_id or not init_point:
         raise HTTPException(502, {"mp_response": resp})
     
@@ -98,6 +103,82 @@ def create_one_time_payment_link(
 
     return CreateOneTimeLinkOut(preference_id=preference_id, init_point=init_point)
 
+# Create recurring subscription link
+@router.post("/recurring/link", response_model=CreateRecurringLinkOut)
+async def create_recurring_subscription_link(
+    payload: CreateOneTimeLinkIn,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user)
+):
+    # Validate Plan
+    plan = db.query(Plan).filter(Plan.code == payload.plan_code).first()
+    if not plan:
+        raise HTTPException(status_code=404, detail="Plan not found")
+    
+    if plan.kind != "recurring":
+        raise HTTPException(status_code=400, detail="Plan is not a recurring subscription plan")
+
+    if not plan.interval_count or not plan.interval_unit:
+        raise HTTPException(status_code=500, detail="Recurring plan is missing interval information")
+    
+    #2) Create or reuse entitlement
+    ent = db.query(Entitlement).filter(
+        Entitlement.user_id == user.id,
+        Entitlement.plan_id == plan.id,
+    ).first()
+
+    if not ent:
+        ent = Entitlement(user_id=user.id, plan_id=plan.id, status="inactive")
+        db.add(ent)
+        db.flush()  # assigns ent.id without committing
+    
+    #3) Stable identifiers to map webhook -> entitlement
+    order_id = str(uuid4())
+    external_ref = f"user:{user.id}|ent:{ent.id}|order:{order_id}|plan:{plan.code}"
+
+    #4) Build Preapproval payload (subscription)
+    # Mercado pago expects ISO8601 start_date
+    start_date = datetime.now(timezone.utc).isoformat()
+
+    preapproval_payload = {
+        "reason": plan.name,
+        "external_reference": external_ref,
+        # Important: back_url is singular here (unlike back_urls in preferences)
+        "back_url": f"{settings.app_base_url}/billing/subscription/return",
+        "payer_email": user.email,
+        "auto_recurring": {
+            "frequency": int(plan.interval_count),
+            "frequency_type": plan.interval_unit,
+            "transaction_amount": float(plan.price),
+            "currency_id": plan.currency or settings.mp_currency,
+            "start_date": start_date,
+        },
+        "status": "pending",
+        "metadata": {
+            "user_id": user.id,
+            "entitlement_id": ent.id,
+            "order_id": order_id,
+            "plan_code": plan.code,
+        }
+    }
+
+    #5) Call MP to create preapproval
+    mp_status, mp_resp = await mp_create_preapproval(preapproval_payload)
+    if mp_status not in (200, 201):
+        raise HTTPException(502, {"mp_status": mp_status, "mp_response": mp_resp})
+    
+    preapproval_id = mp_resp.get("id")
+    init_point = mp_resp.get("init_point")
+    if not preapproval_id or not init_point:
+        raise HTTPException(502, {"mp_response": mp_resp})
+    
+    #6) Store MP reference (still inactive until webhook confirms)
+    ent.mp_preapproval_id = str(preapproval_id)
+    db.commit()
+
+    return CreateRecurringLinkOut(preapproval_id=str(preapproval_id), init_point=init_point)
+
+# Obtain current user's billing info and entitlements
 @router.get("/me")
 def my_billing(db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     ents = (db.query(Entitlement, Plan)
@@ -124,3 +205,39 @@ def my_billing(db: Session = Depends(get_db), user: User = Depends(get_current_u
         })
 
     return {"user_id": user.id, "entitlements": out}
+
+@router.post("/recurring/cancel", response_model=CancelRecurringOut)
+async def cancel_recurring_subscription(
+    payload: CancelRecurringIn,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    plan = db.query(Plan).filter(Plan.code == payload.plan_code).first()
+    if not plan:
+        raise HTTPException(status_code=404, detail="Plan not found")
+    if plan.kind != "recurring":
+        raise HTTPException(status_code=400, detail="Plan is not a recurring subscription plan")
+
+    ent = db.query(Entitlement).filter(
+        Entitlement.user_id == user.id,
+        Entitlement.plan_id == plan.id,
+    ).first()
+    if not ent:
+        raise HTTPException(status_code=404, detail="Entitlement not found")
+    if not ent.mp_preapproval_id:
+        raise HTTPException(status_code=400, detail="No subscription to cancel")
+
+    mp_status, mp_resp = await mp_update_preapproval(
+        ent.mp_preapproval_id,
+        {"status": "cancelled"},
+    )
+    if mp_status not in (200, 201):
+        raise HTTPException(502, {"mp_status": mp_status, "mp_response": mp_resp})
+
+    ent.status = "canceled"
+    db.commit()
+
+    return CancelRecurringOut(
+        preapproval_id=ent.mp_preapproval_id,
+        status=mp_resp.get("status", "cancelled"),
+    )

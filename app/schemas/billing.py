@@ -17,3 +17,17 @@ class CreateOneTimeLinkIn(BaseModel):
 class CreateOneTimeLinkOut(BaseModel):
     preference_id : str
     init_point : str
+
+class CreateRecurringLinkIn(BaseModel):
+    plan_code: str
+
+class CreateRecurringLinkOut(BaseModel):
+    preapproval_id: str
+    init_point: str
+
+class CancelRecurringIn(BaseModel):
+    plan_code: str
+
+class CancelRecurringOut(BaseModel):
+    preapproval_id: str
+    status: str
