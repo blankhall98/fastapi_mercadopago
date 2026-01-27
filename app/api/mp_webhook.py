@@ -44,6 +44,10 @@ async def fetch_preapproval(preapproval_id: str) -> dict[str, Any]:
     return await mp_get_json(f"/preapproval/{preapproval_id}")
 
 
+async def fetch_authorized_payment(authorized_payment_id: str) -> dict[str, Any]:
+    return await mp_get_json(f"/authorized_payments/{authorized_payment_id}")
+
+
 # ---------------------------
 # parsing helpers
 # ---------------------------
@@ -164,6 +168,17 @@ def _extract_id_from_resource_url(resource: str, needle: str) -> str | None:
         return None
 
 
+def _parse_iso_datetime(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        if value.endswith("Z"):
+            value = value[:-1] + "+00:00"
+        return datetime.fromisoformat(value)
+    except Exception:
+        return None
+
+
 # ---------------------------
 # core processors
 # ---------------------------
@@ -229,13 +244,19 @@ async def _process_preapproval(preapproval_id: str, pre: dict[str, Any], db: Ses
 
     ent.mp_preapproval_id = str(preapproval_id)
 
+    auto = pre.get("auto_recurring") or {}
+    end_date = auto.get("end_date") or pre.get("next_payment_date")
+    end_dt = _parse_iso_datetime(end_date)
+
     # Our gating truth: active only when authorized/active
     if status in ("authorized", "active"):
         ent.status = "active"
-        ent.expires_at = None  # recurring access stays active while authorized
+        # keep local period end in sync if MP provides it
+        if end_dt:
+            ent.expires_at = end_dt
     elif status in ("cancelled", "canceled"):
         ent.status = "canceled"
-        ent.expires_at = None
+        ent.expires_at = end_dt or ent.expires_at
     elif status == "paused":
         ent.status = "inactive"
         ent.expires_at = None
@@ -245,6 +266,69 @@ async def _process_preapproval(preapproval_id: str, pre: dict[str, Any], db: Ses
 
     db.commit()
     return {"ok": True, "topic": "preapproval", "mp_status": status, "ent_status": ent.status}
+
+
+async def _process_authorized_payment(
+    authorized_payment_id: str,
+    auth: dict[str, Any],
+    db: Session,
+) -> dict[str, Any]:
+    payment = auth.get("payment") or {}
+    payment_id = payment.get("id")
+    payment_status = payment.get("status")
+    payment_status_detail = payment.get("status_detail")
+    preapproval_id = auth.get("preapproval_id")
+
+    print("MP authorized_payment_id:", authorized_payment_id)
+    print("MP authorized_payment status:", auth.get("status"))
+    print("MP payment_id:", payment_id)
+    print("MP payment_status:", payment_status)
+    print("MP payment_status_detail:", payment_status_detail)
+
+    ent_id: int | None = None
+    end_dt: datetime | None = None
+    pre: dict[str, Any] | None = None
+    external_reference = str(auth.get("external_reference") or "")
+    if external_reference:
+        ent_id = _parse_entitlement_id_from_external_reference(external_reference)
+
+    if preapproval_id:
+        pre = await fetch_preapproval(str(preapproval_id))
+        if not ent_id:
+            ent_id = _extract_entitlement_id_from_preapproval(pre)
+        auto = pre.get("auto_recurring") or {}
+        end_date = auto.get("end_date") or pre.get("next_payment_date")
+        end_dt = _parse_iso_datetime(end_date)
+
+    if not ent_id:
+        return {"ok": True, "warning": "Could not map entitlement (authorized_payment)"}
+
+    ent = db.get(Entitlement, int(ent_id))
+    if not ent:
+        return {"ok": True, "warning": "Entitlement not found (authorized_payment)"}
+
+    if preapproval_id:
+        ent.mp_preapproval_id = str(preapproval_id)
+    if payment_id:
+        ent.mp_payment_id = str(payment_id)
+
+    if payment_status == "approved":
+        ent.status = "active"
+        if end_dt:
+            ent.expires_at = end_dt
+    elif payment_status in ("rejected", "cancelled"):
+        ent.status = "past_due"
+    elif payment_status in ("refunded", "charged_back"):
+        ent.status = "inactive"
+
+    db.commit()
+    return {
+        "ok": True,
+        "topic": "subscription_authorized_payment",
+        "payment_status": payment_status,
+        "payment_status_detail": payment_status_detail,
+        "ent_status": ent.status,
+    }
 
 
 # ---------------------------
@@ -283,6 +367,21 @@ async def mp_webhook(request: Request, db: Session = Depends(get_db)):
 
         pre = await fetch_preapproval(str(preapproval_id))
         return await _process_preapproval(str(preapproval_id), pre, db)
+
+    # 1b) Recurring subscription payments (authorized payments)
+    if topic == "subscription_authorized_payment" or mp_type == "subscription_authorized_payment":
+        authorized_payment_id = (
+            request.query_params.get("id")
+            or data.get("id")
+            or request.query_params.get("data.id")
+            or _extract_id_from_resource_url(resource, "authorized_payments")
+        )
+        if not authorized_payment_id:
+            return {"ok": True, "ignored": "authorized_payment_no_id"}
+
+        _maybe_verify_signature(request, data_id=str(authorized_payment_id))
+        auth = await fetch_authorized_payment(str(authorized_payment_id))
+        return await _process_authorized_payment(str(authorized_payment_id), auth, db)
 
     # 2) One-time payments / payment events
     payment_id: str | None = None

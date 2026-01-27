@@ -1,5 +1,6 @@
 from uuid import uuid4
-from datetime import datetime, timezone
+import calendar
+from datetime import datetime, timezone, timedelta
 from app.utils.dt import as_utc_aware
 
 from fastapi import APIRouter, HTTPException, Depends
@@ -11,11 +12,38 @@ from app.api.deps import get_current_user
 from app.models.plan import Plan
 from app.models.entitlement import Entitlement
 from app.integrations.mercadopago_client import mp_sdk
-from app.integrations.mp_subscriptions import mp_create_preapproval, mp_update_preapproval
+from app.integrations.mp_subscriptions import mp_create_preapproval, mp_update_preapproval, mp_get_preapproval
 from app.schemas.billing import PlanOut, CreateOneTimeLinkIn, CreateOneTimeLinkOut, CreateRecurringLinkIn, CreateRecurringLinkOut, CancelRecurringIn, CancelRecurringOut
 from app.models.user import User
 
 router = APIRouter(prefix="/billing", tags=["billing"])
+
+
+def _parse_iso_datetime(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        if value.endswith("Z"):
+            value = value[:-1] + "+00:00"
+        return datetime.fromisoformat(value)
+    except Exception:
+        return None
+
+
+def _add_interval(start: datetime, count: int, unit: str) -> datetime:
+    if unit == "days":
+        return start + timedelta(days=count)
+    if unit == "months":
+        total_months = (start.year * 12 + (start.month - 1)) + count
+        year = total_months // 12
+        month = total_months % 12 + 1
+        day = min(start.day, calendar.monthrange(year, month)[1])
+        return start.replace(year=year, month=month, day=day)
+    if unit == "years":
+        year = start.year + count
+        day = min(start.day, calendar.monthrange(year, start.month)[1])
+        return start.replace(year=year, day=day)
+    return start
 
 # Display available subscription plans
 @router.get("/plans", response_model=list[PlanOut])
@@ -192,7 +220,10 @@ def my_billing(db: Session = Depends(get_db), user: User = Depends(get_current_u
     out = []
     for ent, plan in ents:
         exp = as_utc_aware(ent.expires_at)
-        is_active = ent.status == "active" and (exp is None or exp > now)
+        is_active = (
+            (ent.status == "active" and (exp is None or exp > now))
+            or (ent.status == "canceled" and exp and exp > now)
+        )
         out.append({
             "plan_code": plan.code,
             "plan_kind": plan.kind,
@@ -227,14 +258,27 @@ async def cancel_recurring_subscription(
     if not ent.mp_preapproval_id:
         raise HTTPException(status_code=400, detail="No subscription to cancel")
 
-    mp_status, mp_resp = await mp_update_preapproval(
-        ent.mp_preapproval_id,
-        {"status": "cancelled"},
-    )
+    mp_get_status, mp_get_resp = await mp_get_preapproval(ent.mp_preapproval_id)
+    if mp_get_status not in (200, 201):
+        raise HTTPException(502, {"mp_status": mp_get_status, "mp_response": mp_get_resp})
+
+    auto = mp_get_resp.get("auto_recurring") or {}
+    end_date_str = auto.get("end_date") or mp_get_resp.get("next_payment_date")
+    cancel_at = _parse_iso_datetime(end_date_str)
+
+    if not cancel_at:
+        base_str = mp_get_resp.get("last_charge_date") or mp_get_resp.get("date_created") or auto.get("start_date")
+        base_dt = _parse_iso_datetime(base_str) or datetime.now(timezone.utc)
+        cancel_at = _add_interval(base_dt, int(plan.interval_count), str(plan.interval_unit))
+
+    update_payload = {"auto_recurring": {"end_date": cancel_at.isoformat()}} if cancel_at else {"status": "cancelled"}
+
+    mp_status, mp_resp = await mp_update_preapproval(ent.mp_preapproval_id, update_payload)
     if mp_status not in (200, 201):
         raise HTTPException(502, {"mp_status": mp_status, "mp_response": mp_resp})
 
     ent.status = "canceled"
+    ent.expires_at = as_utc_aware(cancel_at) if cancel_at else ent.expires_at
     db.commit()
 
     return CancelRecurringOut(
